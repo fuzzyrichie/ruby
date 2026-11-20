@@ -1799,6 +1799,10 @@ cont_restore_0(rb_context_t *cont, VALUE *addr_in_prev_frame)
 static VALUE
 rb_callcc(VALUE self)
 {
+    /* A continuation can re-enter frames of run-once ISeqs that are still
+     * executing, so stop releasing them from now on. */
+    rb_iseq_run_once_release_disabled = true;
+
     volatile int called;
     volatile VALUE val = cont_capture(&called);
 

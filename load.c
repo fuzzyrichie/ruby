@@ -795,6 +795,10 @@ load_iseq_eval(rb_execution_context_t *ec, VALUE fname)
     }
     rb_exec_event_hook_script_compiled(ec, iseq, Qnil);
     rb_iseq_eval(iseq);
+    /* The top-level ISeq of a loaded file has finished and can never run
+     * again; release its instructions (and those of class bodies it
+     * defined). */
+    rb_iseq_release_run_once(iseq);
 }
 
 static inline enum ruby_tag_type

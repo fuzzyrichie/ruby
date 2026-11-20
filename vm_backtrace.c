@@ -52,16 +52,25 @@ calc_pos(const rb_iseq_t *iseq, const VALUE *pc, int *lineno, int *node_id)
         return 1;
     }
     else {
-        VM_ASSERT(ISEQ_BODY(iseq));
-        VM_ASSERT(ISEQ_BODY(iseq)->iseq_encoded);
-        VM_ASSERT(ISEQ_BODY(iseq)->iseq_size);
-
-        ptrdiff_t n = pc - ISEQ_BODY(iseq)->iseq_encoded;
+        const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+        VM_ASSERT(body);
+        ptrdiff_t n;
+        if (UNLIKELY(!body->iseq_encoded && body->released_iseq_encoded)) {
+            /* Run-once ISeq whose instructions were released after this
+             * location was captured; only line info remains. */
+            n = (ptrdiff_t)(((uintptr_t)pc - body->released_iseq_encoded) / sizeof(VALUE));
+            VM_ASSERT((unsigned int)n <= body->released_iseq_size);
+        }
+        else {
+            VM_ASSERT(body->iseq_encoded);
+            VM_ASSERT(body->iseq_size);
+            n = pc - body->iseq_encoded;
+            VM_ASSERT((unsigned int)n <= body->iseq_size);
+        }
         VM_ASSERT(n >= 0);
 #if SIZEOF_PTRDIFF_T > SIZEOF_INT
         VM_ASSERT(n <= (ptrdiff_t)UINT_MAX);
 #endif
-        VM_ASSERT((unsigned int)n <= ISEQ_BODY(iseq)->iseq_size);
         ASSUME(n >= 0);
         size_t pos = n; /* no overflow */
         if (LIKELY(pos)) {

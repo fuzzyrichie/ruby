@@ -4186,7 +4186,11 @@ static VALUE
 iseqw_to_binary(int argc, VALUE *argv, VALUE self)
 {
     VALUE opt = !rb_check_arity(argc, 0, 1) ? Qnil : argv[0];
-    return rb_iseq_ibf_dump(iseqw_check(self), opt);
+    const rb_iseq_t *iseq = iseqw_check(self);
+    if (!ISEQ_BODY(iseq)->iseq_encoded && ISEQ_BODY(iseq)->released_iseq_encoded) {
+        rb_raise(rb_eRuntimeError, "cannot dump an InstructionSequence whose instructions were released");
+    }
+    return rb_iseq_ibf_dump(iseq, opt);
 }
 
 /*
@@ -4399,6 +4403,215 @@ iseqw_script_lines(VALUE self)
  *  Of course, this class is MRI specific.
  */
 
+/*
+ * Run-once ISeq release (prototype, opt-in with RUBY_ISEQ_RELEASE_RUN_ONCE=1).
+ *
+ * The top-level ISeq of a file evaluated by require/load runs exactly once,
+ * and so does every class/module body reached through a `defineclass`
+ * operand of that top-level ISeq (recursively through class bodies, never
+ * through blocks or methods). Once the top-level ISeq has returned, none of
+ * these can be entered again, but the whole tree stays reachable whenever
+ * any child (e.g. a Proc created in a class body) is retained, because the
+ * child's parent_iseq/local_iseq keeps the parent alive and the parent's
+ * operands keep every sibling alive.
+ *
+ * Releasing frees the instruction stream and everything only the
+ * interpreter uses while executing it (operands, inline caches, call data,
+ * catch table, GC mark bits). The body struct, local table, location,
+ * params and line info (insns_info) are kept, so children, bindings and
+ * already-captured backtrace locations keep working.
+ */
+bool rb_iseq_run_once_release_disabled = false;
+static int iseq_run_once_release_enabled = -1;
+static size_t iseq_run_once_released_count = 0;
+static size_t iseq_run_once_released_bytes = 0;
+static size_t iseq_run_once_skipped_count = 0;
+
+int rb_vm_insn_decode(const VALUE encoded);
+
+static bool
+iseq_run_once_releasable_p(const rb_iseq_t *iseq)
+{
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+
+    if (!body || !body->iseq_encoded) return false; /* already released */
+    if (!ISEQ_EXECUTABLE_P(iseq)) return false;
+    if (FL_TEST_RAW((VALUE)iseq, ISEQ_NOT_LOADED_YET | ISEQ_USE_COMPILE_DATA)) return false;
+    if (iseq->aux.exec.local_hooks) return false; /* targeted TracePoint */
+#if USE_RJIT || USE_YJIT
+    if (body->jit_entry) return false;
+#endif
+#if USE_YJIT
+    if (body->jit_exception || body->yjit_payload) return false;
+#endif
+#if USE_RJIT
+    if (RTEST(body->rjit_blocks)) return false;
+#endif
+    return true;
+}
+
+/* Shrink line info to one entry per line change. Events are irrelevant for
+ * code that never runs again; node_ids are dropped (-1 = unknown), which only
+ * affects error_highlight / AST.of for locations captured inside the
+ * released code. */
+static size_t
+iseq_compact_insns_info(struct rb_iseq_constant_body *body)
+{
+    unsigned int size = body->insns_info.size;
+    if (size <= 1) return 0;
+
+#if VM_INSN_INFO_TABLE_IMPL == 2
+    unsigned int *positions = body->insns_info.positions ?
+        body->insns_info.positions : rb_iseq_insns_info_decode_positions(body);
+#else
+    unsigned int *positions = (unsigned int *)body->insns_info.positions;
+#endif
+    struct iseq_insn_info_entry *entries = (struct iseq_insn_info_entry *)body->insns_info.body;
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < size; i++) {
+        if (n == 0 || entries[i].line_no != entries[n - 1].line_no) {
+            entries[n].line_no = entries[i].line_no;
+#ifdef USE_ISEQ_NODE_ID
+            entries[n].node_id = -1;
+#endif
+            entries[n].events = 0;
+            positions[n] = positions[i];
+            n++;
+        }
+    }
+    size_t saved = (size - n) * (sizeof(struct iseq_insn_info_entry) + sizeof(unsigned int));
+    body->insns_info.body = ruby_xrealloc((void *)entries, n * sizeof(struct iseq_insn_info_entry));
+    body->insns_info.positions = ruby_xrealloc(positions, n * sizeof(unsigned int));
+    body->insns_info.size = n;
+#if VM_INSN_INFO_TABLE_IMPL == 2
+    {
+        /* Rebuild the succinct index (uses body->iseq_size as max_pos). */
+        struct succ_index_table *old = body->insns_info.succ_index_table;
+        body->insns_info.succ_index_table = succ_index_table_create(body->iseq_size, (int *)body->insns_info.positions, n);
+        ruby_xfree(old);
+#if VM_CHECK_MODE == 0
+        ruby_xfree((void *)body->insns_info.positions);
+        body->insns_info.positions = NULL;
+#endif
+    }
+#endif
+    return saved;
+}
+
+static void
+iseq_release_body(const rb_iseq_t *iseq)
+{
+    struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+    size_t bytes = 0;
+
+    bytes += iseq_compact_insns_info(body);
+
+    iseq_clear_ic_references(iseq);
+
+    bytes += body->iseq_size * sizeof(VALUE);
+    bytes += ISEQ_IS_SIZE(body) * sizeof(union iseq_inline_storage_entry);
+    bytes += body->ci_size * sizeof(struct rb_call_data);
+    if (body->catch_table) bytes += iseq_catch_table_bytes(body->catch_table->size);
+
+    if (ISEQ_MBITS_BUFLEN(body->iseq_size) > 1 && body->mark_bits.list) {
+        bytes += ISEQ_MBITS_BUFLEN(body->iseq_size) * ISEQ_MBITS_SIZE;
+        ruby_xfree((void *)body->mark_bits.list);
+    }
+    body->mark_bits.list = NULL;
+
+    if (body->variable.original_iseq) {
+        bytes += body->iseq_size * sizeof(VALUE);
+        ruby_xfree(body->variable.original_iseq);
+        body->variable.original_iseq = NULL;
+    }
+
+    ruby_xfree((void *)body->is_entries);
+    body->is_entries = NULL;
+    body->ivc_size = body->icvarc_size = body->ise_size = body->ic_size = 0;
+
+    ruby_xfree(body->call_data);
+    body->call_data = NULL;
+    body->ci_size = 0;
+
+    ruby_xfree((void *)body->catch_table);
+    body->catch_table = NULL;
+
+    body->released_iseq_encoded = (uintptr_t)body->iseq_encoded;
+    body->released_iseq_size = body->iseq_size;
+    ruby_xfree((void *)body->iseq_encoded);
+    body->iseq_encoded = NULL;
+    body->iseq_size = 0;
+
+    iseq_run_once_released_count++;
+    iseq_run_once_released_bytes += bytes;
+}
+
+static void
+iseq_release_run_once_tree(const rb_iseq_t *iseq, int depth)
+{
+    const struct rb_iseq_constant_body *body = ISEQ_BODY(iseq);
+
+    if (!iseq_run_once_releasable_p(iseq)) {
+        iseq_run_once_skipped_count++;
+        return;
+    }
+
+    /* Class bodies defined directly by this (finished) ISeq can never be
+     * entered again either. */
+    if (depth < 64) {
+        const VALUE *code = body->iseq_encoded;
+        for (unsigned int i = 0; i < body->iseq_size;) {
+            int insn = rb_vm_insn_decode(code[i]);
+            if (insn == BIN(defineclass)) {
+                const rb_iseq_t *class_iseq = (const rb_iseq_t *)code[i + 2];
+                if (class_iseq && ISEQ_BODY(class_iseq)->type == ISEQ_TYPE_CLASS) {
+                    iseq_release_run_once_tree(class_iseq, depth + 1);
+                }
+            }
+            i += insn_len(insn);
+        }
+    }
+
+    iseq_release_body(iseq);
+}
+
+void
+rb_iseq_release_run_once(const rb_iseq_t *iseq)
+{
+    if (iseq_run_once_release_enabled < 0) {
+        const char *env = getenv("RUBY_ISEQ_RELEASE_RUN_ONCE");
+        iseq_run_once_release_enabled = (env && env[0] == '1');
+    }
+    if (!iseq_run_once_release_enabled || rb_iseq_run_once_release_disabled) return;
+    if (!iseq || ISEQ_BODY(iseq)->type != ISEQ_TYPE_TOP) return;
+    /* Coverage counters are kept on the body and stay valid, but be
+     * conservative while coverage measurement is running. */
+    if (RTEST(rb_get_coverages())) return;
+
+    RB_VM_LOCK_ENTER();
+    {
+        iseq_release_run_once_tree(iseq, 0);
+    }
+    RB_VM_LOCK_LEAVE();
+}
+
+/*
+ *  call-seq:
+ *     RubyVM::InstructionSequence.run_once_release_stats -> hash
+ *
+ *  Prototype instrumentation for RUBY_ISEQ_RELEASE_RUN_ONCE.
+ */
+static VALUE
+iseqw_s_run_once_release_stats(VALUE klass)
+{
+    VALUE h = rb_hash_new();
+    rb_hash_aset(h, ID2SYM(rb_intern("enabled")), RBOOL(iseq_run_once_release_enabled == 1 && !rb_iseq_run_once_release_disabled));
+    rb_hash_aset(h, ID2SYM(rb_intern("released")), SIZET2NUM(iseq_run_once_released_count));
+    rb_hash_aset(h, ID2SYM(rb_intern("released_bytes")), SIZET2NUM(iseq_run_once_released_bytes));
+    rb_hash_aset(h, ID2SYM(rb_intern("skipped")), SIZET2NUM(iseq_run_once_skipped_count));
+    return h;
+}
+
 void
 Init_ISeq(void)
 {
@@ -4443,6 +4656,7 @@ Init_ISeq(void)
     rb_define_singleton_method(rb_cISeq, "disasm", iseqw_s_disasm, 1);
     rb_define_singleton_method(rb_cISeq, "disassemble", iseqw_s_disasm, 1);
     rb_define_singleton_method(rb_cISeq, "of", iseqw_s_of, 1);
+    rb_define_singleton_method(rb_cISeq, "run_once_release_stats", iseqw_s_run_once_release_stats, 0);
 
     // script lines
     rb_define_method(rb_cISeq, "script_lines", iseqw_script_lines, 0);

@@ -561,6 +561,12 @@ struct rb_iseq_constant_body {
     // Used to estimate how frequently this ISEQ gets called
     uint64_t yjit_calls_at_interv;
 #endif
+
+    // Set by rb_iseq_release_run_once() when iseq_encoded has been freed.
+    // Only used for pointer arithmetic on PCs captured in backtraces before
+    // the release (never dereferenced).
+    uintptr_t released_iseq_encoded;
+    unsigned int released_iseq_size;
 };
 
 /* T_IMEMO/iseq */
@@ -1833,6 +1839,8 @@ NORETURN(void rb_bug_for_fatal_signal(ruby_sighandler_t default_sighandler, int 
 RUBY_SYMBOL_EXPORT_BEGIN
 VALUE rb_iseq_eval(const rb_iseq_t *iseq);
 VALUE rb_iseq_eval_main(const rb_iseq_t *iseq);
+void rb_iseq_release_run_once(const rb_iseq_t *iseq);
+extern bool rb_iseq_run_once_release_disabled;
 VALUE rb_iseq_path(const rb_iseq_t *iseq);
 VALUE rb_iseq_realpath(const rb_iseq_t *iseq);
 RUBY_SYMBOL_EXPORT_END
